@@ -8,6 +8,7 @@ import {
   MapPin,
   Building2,
   Check,
+  AlertCircle,
 } from 'lucide-react';
 import {
   AdminState,
@@ -21,8 +22,11 @@ import { formatDateRu, formatRub, uid } from '../utils/format';
 
 interface OrdersPageProps {
   state: AdminState;
-  setState: React.Dispatch<React.SetStateAction<AdminState>>;
   globalQuery: string;
+  onUpdateOrderStatus: (orderId: string, status: OrderStatus) => Promise<void>;
+  onCreateOrder: (order: Order) => Promise<void>;
+  isAuthError: (err: unknown) => boolean;
+  onAuthRequired: (message?: string) => void;
 }
 
 const ORDER_STATUSES: OrderStatus[] = ['ОБРАБОТКА', 'ВЫПОЛНЕН', 'ОТМЕНЕН'];
@@ -38,12 +42,21 @@ const PAYMENT_METHODS: PaymentMethod[] = [
   'Покупай со Сбером',
 ];
 
-export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQuery }) => {
+export const OrdersPage: React.FC<OrdersPageProps> = ({
+  state,
+  globalQuery,
+  onUpdateOrderStatus,
+  onCreateOrder,
+  isAuthError,
+  onAuthRequired,
+}) => {
   const [statusTab, setStatusTab] = useState<'all' | OrderStatus | 'oneclick'>('all');
   const [deliveryFilter, setDeliveryFilter] = useState<'all' | DeliveryMethod>('all');
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [invoiceOrder, setInvoiceOrder] = useState<Order | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const [newOrderForm, setNewOrderForm] = useState({
     firstName: '',
@@ -69,62 +82,83 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
       if (statusTab !== 'all' && statusTab !== 'oneclick' && o.status !== statusTab) return false;
       if (deliveryFilter !== 'all' && o.deliveryMethod !== deliveryFilter) return false;
       if (q) {
-        const hay = `${o.orderNumber} ${o.customerFirstName} ${o.customerLastName} ${o.companyName ?? ''} ${o.phone} ${o.city}`.toLowerCase();
+        const hay = `${o.orderNumber} ${o.backendStatus ?? ''} ${o.customerFirstName} ${o.customerLastName} ${o.companyName ?? ''} ${o.phone} ${o.city}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
   }, [state.orders, statusTab, deliveryFilter, q]);
 
-  const updateOrderStatus = (orderId: string, status: OrderStatus) => {
-    setState((prev) => ({
-      ...prev,
-      orders: prev.orders.map((o) => (o.id === orderId ? { ...o, status } : o)),
-    }));
-    setSelectedOrder((prev) => (prev && prev.id === orderId ? { ...prev, status } : prev));
+  const handleApiError = (err: unknown, authMsg: string) => {
+    if (isAuthError(err)) {
+      onAuthRequired(authMsg);
+    } else {
+      setActionError(err instanceof Error ? err.message : 'Ошибка запроса к API');
+    }
   };
 
-  const handleCreateOrder = () => {
-    const product = state.products.find((p) => p.id === newOrderForm.productId);
+  const updateOrderStatus = async (orderId: string, status: OrderStatus) => {
+    setActionError(null);
+    try {
+      await onUpdateOrderStatus(orderId, status);
+      setSelectedOrder((prev) => (prev && prev.id === orderId ? { ...prev, status } : prev));
+    } catch (err) {
+      handleApiError(err, 'Для изменения статуса заказа необходимо войти в аккаунт API.');
+    }
+  };
+
+  const handleCreateOrder = async () => {
+    const product = state.products.find((p) => p.id === newOrderForm.productId) ?? state.products[0];
     if (!newOrderForm.firstName.trim() || !newOrderForm.phone.trim() || !product) return;
 
-    const subtotal = product.price * newOrderForm.quantity;
-    const deliveryCost = newOrderForm.deliveryMethod === 'Самовывоз' ? 0 : 550;
-    const created: Order = {
-      id: uid('ord'),
-      orderNumber: `#${Math.floor(56440 + Math.random() * 900)}`,
-      createdAt: new Date().toISOString(),
-      status: 'ОБРАБОТКА',
-      isOneClick: false,
-      customerFirstName: newOrderForm.firstName.trim(),
-      customerLastName: newOrderForm.lastName.trim() || 'Покупатель',
-      companyName: newOrderForm.companyName.trim() || undefined,
-      email: newOrderForm.email.trim() || 'client@stroiopttorg.ru',
-      phone: newOrderForm.phone.trim(),
-      region: newOrderForm.region,
-      city: newOrderForm.city,
-      deliveryMethod: newOrderForm.deliveryMethod,
-      deliveryAddress: newOrderForm.deliveryAddress,
-      paymentMethod: newOrderForm.paymentMethod,
-      promoDiscount: 0,
-      tierDiscount: 0,
-      deliveryCost,
-      items: [
-        {
-          productId: product.id,
-          sku: product.sku,
-          name: product.name,
-          price: product.price,
-          oldPrice: product.oldPrice,
-          quantity: newOrderForm.quantity,
-        },
-      ],
-      totalAmount: subtotal + deliveryCost,
-      comment: newOrderForm.comment.trim() || undefined,
-    };
+    setSaving(true);
+    setActionError(null);
+    try {
+      const subtotal = product.price * newOrderForm.quantity;
+      const deliveryCost = newOrderForm.deliveryMethod === 'Самовывоз' ? 0 : 550;
+      const rawNum = `ADM-${Math.floor(10000 + Math.random() * 90000)}`;
+      const created: Order = {
+        id: uid('ord'),
+        orderNumber: `#${rawNum}`,
+        rawNumber: rawNum,
+        backendStatus: 'pending',
+        createdAt: new Date().toISOString(),
+        status: 'ОБРАБОТКА',
+        isOneClick: false,
+        customerFirstName: newOrderForm.firstName.trim(),
+        customerLastName: newOrderForm.lastName.trim() || 'Покупатель',
+        companyName: newOrderForm.companyName.trim() || undefined,
+        email: newOrderForm.email.trim() || 'client@stroiopttorg.ru',
+        phone: newOrderForm.phone.trim(),
+        region: newOrderForm.region,
+        city: newOrderForm.city,
+        deliveryMethod: newOrderForm.deliveryMethod,
+        deliveryAddress: newOrderForm.deliveryAddress,
+        paymentMethod: newOrderForm.paymentMethod,
+        promoDiscount: 0,
+        tierDiscount: 0,
+        deliveryCost,
+        items: [
+          {
+            productId: product.id,
+            sku: product.sku,
+            name: product.name,
+            price: product.price,
+            oldPrice: product.oldPrice,
+            quantity: newOrderForm.quantity,
+          },
+        ],
+        totalAmount: subtotal + deliveryCost,
+        comment: newOrderForm.comment.trim() || undefined,
+      };
 
-    setState((prev) => ({ ...prev, orders: [created, ...prev.orders] }));
-    setCreateOpen(false);
+      await onCreateOrder(created);
+      setCreateOpen(false);
+    } catch (err) {
+      handleApiError(err, 'Для создания заказа необходимо войти в аккаунт API.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const counts = {
@@ -138,12 +172,15 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
   return (
     <div>
       <PageHeader
-        title="Заказы и оформление (СДЭК / Самовывоз)"
-        subtitle="Обработка заказов с сайта, покупок в 1 клик и B2B-заявок"
+        title="Заказы и оформление"
+        subtitle="Заказы из Backend API и ручное оформление менеджером"
         actions={
           <button
             type="button"
-            onClick={() => setCreateOpen(true)}
+            onClick={() => {
+              setActionError(null);
+              setCreateOpen(true);
+            }}
             className="inline-flex items-center gap-1.5 rounded-lg bg-[#186FD4] px-4 py-2 text-sm font-semibold text-white hover:bg-[#145BB0]"
           >
             <Plus className="h-4 w-4" />
@@ -151,6 +188,13 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
           </button>
         }
       />
+
+      {actionError && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-[#E11D48]">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{actionError}</span>
+        </div>
+      )}
 
       {/* Tabs + Delivery filter */}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -200,9 +244,9 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
             <thead className="border-b border-[#E5E7EB] bg-[#F5F7FA] text-xs font-semibold uppercase text-slate-500">
               <tr>
                 <th className="px-4 py-3">Номер / Дата</th>
-                <th className="px-4 py-3">Покупатель / Компания</th>
-                <th className="px-4 py-3">Доставка и город</th>
-                <th className="px-4 py-3">Оплата и промо</th>
+                <th className="px-4 py-3">Покупатель / ID</th>
+                <th className="px-4 py-3">Доставка</th>
+                <th className="px-4 py-3">Оплата / API статус</th>
                 <th className="px-4 py-3">Статус</th>
                 <th className="px-4 py-3 text-right">Итого</th>
                 <th className="px-4 py-3 text-right">Просмотр</th>
@@ -228,7 +272,9 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
                         {ord.companyName}
                       </div>
                     )}
-                    <div className="text-xs text-slate-400">{ord.phone}</div>
+                    <div className="text-xs text-slate-400">
+                      {ord.phone !== '—' ? ord.phone : `Order ID: ${ord.id}`}
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-xs">
                     <div className="font-semibold text-[#102035]">{ord.deliveryMethod}</div>
@@ -239,16 +285,16 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
                   </td>
                   <td className="px-4 py-3 text-xs">
                     <div className="text-[#111827]">{ord.paymentMethod}</div>
-                    {ord.promoCode && (
-                      <div className="mt-0.5 font-mono text-[11px] font-semibold text-[#1A9C56]">
-                        Промо: {ord.promoCode}
+                    {ord.backendStatus && (
+                      <div className="mt-0.5 font-mono text-[11px] text-slate-400">
+                        API: {ord.backendStatus}
                       </div>
                     )}
                   </td>
                   <td className="px-4 py-3">
                     <select
                       value={ord.status}
-                      onChange={(e) => updateOrderStatus(ord.id, e.target.value as OrderStatus)}
+                      onChange={(e) => void updateOrderStatus(ord.id, e.target.value as OrderStatus)}
                       className={`rounded-md border px-2 py-1 text-xs font-bold focus:outline-none ${
                         ord.status === 'ВЫПОЛНЕН'
                           ? 'border-emerald-200 bg-emerald-50 text-[#1A9C56]'
@@ -266,7 +312,9 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums">
                     <div className="font-bold text-[#102035]">{formatRub(ord.totalAmount)}</div>
-                    <div className="text-xs text-slate-400">{ord.items.length} поз.</div>
+                    <div className="text-xs text-slate-400">
+                      {ord.items.length > 0 ? `${ord.items.length} поз.` : 'API заказ'}
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-right">
                     <div className="inline-flex items-center gap-1">
@@ -295,7 +343,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
         </div>
       </Card>
 
-      {/* Order Detail Drawer matching Figma Страница заказа */}
+      {/* Order Detail Drawer */}
       <DrawerModal
         open={!!selectedOrder}
         onClose={() => setSelectedOrder(null)}
@@ -341,7 +389,9 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
                   >
                     {selectedOrder.status}
                   </Badge>
-                  {selectedOrder.isOneClick && <Badge variant="blue">Быстрый заказ (1 клик)</Badge>}
+                  {selectedOrder.backendStatus && (
+                    <Badge variant="gray">API: {selectedOrder.backendStatus}</Badge>
+                  )}
                 </div>
               </div>
               <div className="flex gap-1.5">
@@ -349,7 +399,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
                   <button
                     key={st}
                     type="button"
-                    onClick={() => updateOrderStatus(selectedOrder.id, st)}
+                    onClick={() => void updateOrderStatus(selectedOrder.id, st)}
                     className={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${
                       selectedOrder.status === st
                         ? 'border-[#102035] bg-[#102035] text-white'
@@ -407,41 +457,39 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
               <div className="border-b border-[#E5E7EB] bg-[#F5F7FA] px-4 py-2.5 text-xs font-bold uppercase text-slate-500">
                 Состав заказа
               </div>
-              <div className="divide-y divide-[#E5E7EB]">
-                {selectedOrder.items.map((item) => (
-                  <div key={item.productId} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
-                    <div>
-                      <div className="text-[11px] font-mono text-slate-400">{item.sku}</div>
-                      <div className="font-semibold text-[#102035]">{item.name}</div>
-                    </div>
-                    <div className="text-right tabular-nums shrink-0">
-                      <div className="font-bold text-[#102035]">
-                        {formatRub(item.price * item.quantity)}
+              {selectedOrder.items.length === 0 ? (
+                <div className="px-4 py-4 text-xs text-slate-500">
+                  Позиции заказа не передаются в эндпоинте <code>/orders/</code> — отображается общая сумма заказа.
+                </div>
+              ) : (
+                <div className="divide-y divide-[#E5E7EB]">
+                  {selectedOrder.items.map((item) => (
+                    <div key={item.productId} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
+                      <div>
+                        <div className="text-[11px] font-mono text-slate-400">{item.sku}</div>
+                        <div className="font-semibold text-[#102035]">{item.name}</div>
                       </div>
-                      <div className="text-xs text-slate-500">
-                        {item.quantity} × {formatRub(item.price)}
+                      <div className="text-right tabular-nums shrink-0">
+                        <div className="font-bold text-[#102035]">
+                          {formatRub(item.price * item.quantity)}
+                        </div>
+                        <div className="text-xs text-slate-500">
+                          {item.quantity} × {formatRub(item.price)}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
 
-            {/* Totals Breakdown matching Корзина */}
+            {/* Totals Breakdown */}
             <div className="rounded-xl border border-[#E5E7EB] bg-[#F5F7FA] p-4 space-y-2 text-sm">
               {selectedOrder.promoDiscount > 0 && (
                 <div className="flex justify-between text-[#1A9C56]">
-                  <span>Скидка по промокоду ({selectedOrder.promoCode})</span>
+                  <span>Скидка</span>
                   <span className="font-semibold tabular-nums">
                     -{formatRub(selectedOrder.promoDiscount)}
-                  </span>
-                </div>
-              )}
-              {selectedOrder.tierDiscount > 0 && (
-                <div className="flex justify-between text-[#1A9C56]">
-                  <span>Скидка от суммы заказа</span>
-                  <span className="font-semibold tabular-nums">
-                    -{formatRub(selectedOrder.tierDiscount)}
                   </span>
                 </div>
               )}
@@ -504,28 +552,30 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
               {invoiceOrder.companyName ? ` (${invoiceOrder.companyName})` : ''}, тел.{' '}
               {invoiceOrder.phone}
             </div>
-            <table className="w-full border-collapse border border-[#E5E7EB]">
-              <thead className="bg-slate-100">
-                <tr>
-                  <th className="border border-[#E5E7EB] p-2 text-left">Артикул</th>
-                  <th className="border border-[#E5E7EB] p-2 text-left">Товар</th>
-                  <th className="border border-[#E5E7EB] p-2 text-right">Кол-во</th>
-                  <th className="border border-[#E5E7EB] p-2 text-right">Сумма</th>
-                </tr>
-              </thead>
-              <tbody>
-                {invoiceOrder.items.map((it) => (
-                  <tr key={it.productId}>
-                    <td className="border border-[#E5E7EB] p-2 font-mono">{it.sku}</td>
-                    <td className="border border-[#E5E7EB] p-2">{it.name}</td>
-                    <td className="border border-[#E5E7EB] p-2 text-right">{it.quantity}</td>
-                    <td className="border border-[#E5E7EB] p-2 text-right tabular-nums">
-                      {formatRub(it.price * it.quantity)}
-                    </td>
+            {invoiceOrder.items.length > 0 && (
+              <table className="w-full border-collapse border border-[#E5E7EB]">
+                <thead className="bg-slate-100">
+                  <tr>
+                    <th className="border border-[#E5E7EB] p-2 text-left">Артикул</th>
+                    <th className="border border-[#E5E7EB] p-2 text-left">Товар</th>
+                    <th className="border border-[#E5E7EB] p-2 text-right">Кол-во</th>
+                    <th className="border border-[#E5E7EB] p-2 text-right">Сумма</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {invoiceOrder.items.map((it) => (
+                    <tr key={it.productId}>
+                      <td className="border border-[#E5E7EB] p-2 font-mono">{it.sku}</td>
+                      <td className="border border-[#E5E7EB] p-2">{it.name}</td>
+                      <td className="border border-[#E5E7EB] p-2 text-right">{it.quantity}</td>
+                      <td className="border border-[#E5E7EB] p-2 text-right tabular-nums">
+                        {formatRub(it.price * it.quantity)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
             <div className="text-right text-sm font-bold text-[#102035]">
               Всего к оплате: {formatRub(invoiceOrder.totalAmount)}
             </div>
@@ -537,7 +587,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
       <CenterModal
         open={createOpen}
         onClose={() => setCreateOpen(false)}
-        title="Оформление нового заказа (менеджер)"
+        title="Оформление нового заказа (API)"
         maxWidthClass="max-w-xl"
         footer={
           <>
@@ -550,11 +600,12 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
             </button>
             <button
               type="button"
-              onClick={handleCreateOrder}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-[#186FD4] px-4 py-1.5 text-sm font-semibold text-white hover:bg-[#145BB0]"
+              disabled={saving}
+              onClick={() => void handleCreateOrder()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#186FD4] px-4 py-1.5 text-sm font-semibold text-white hover:bg-[#145BB0] disabled:opacity-60"
             >
               <Check className="h-4 w-4" />
-              Создать заказ
+              {saving ? 'Создание...' : 'Создать заказ'}
             </button>
           </>
         }
@@ -604,7 +655,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ state, setState, globalQ
             <div>
               <label className="block text-xs font-semibold">Товар</label>
               <select
-                value={newOrderForm.productId}
+                value={newOrderForm.productId || state.products[0]?.id || ''}
                 onChange={(e) => setNewOrderForm({ ...newOrderForm, productId: e.target.value })}
                 className="mt-1 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 py-1.5"
               >

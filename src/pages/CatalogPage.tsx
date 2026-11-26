@@ -9,23 +9,37 @@ import {
   Plus,
   Layers,
   Check,
+  AlertCircle,
 } from 'lucide-react';
 import { AdminState, Brand, CategoryNode } from '../types/admin';
 import { Badge, Card, CenterModal, DrawerModal, PageHeader } from '../components/ui/Primitives';
-import { formatNumber, uid } from '../utils/format';
+import { formatNumber, slugifyLatin, uid } from '../utils/format';
 
 interface CatalogPageProps {
   state: AdminState;
-  setState: React.Dispatch<React.SetStateAction<AdminState>>;
   globalQuery: string;
+  onSaveCategory: (cat: CategoryNode, isNew: boolean) => Promise<void>;
+  onDeleteCategory: (id: string) => Promise<void>;
+  onSaveBrand: (brand: Brand, isNew: boolean) => Promise<void>;
+  onDeleteBrand: (id: string) => Promise<void>;
+  isAuthError: (err: unknown) => boolean;
+  onAuthRequired: (message?: string) => void;
 }
 
-export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globalQuery }) => {
+export const CatalogPage: React.FC<CatalogPageProps> = ({
+  state,
+  globalQuery,
+  onSaveCategory,
+  onDeleteCategory,
+  onSaveBrand,
+  onDeleteBrand,
+  isAuthError,
+  onAuthRequired,
+}) => {
   const [tab, setTab] = useState<'categories' | 'brands'>('categories');
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({
-    'cat-4': true,
-    'cat-4-1': true,
-  });
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [saving, setSaving] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // Category editor drawer state
   const [editingCat, setEditingCat] = useState<CategoryNode | null>(null);
@@ -35,8 +49,11 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
   const [editingBrand, setEditingBrand] = useState<Brand | null>(null);
   const [isNewBrand, setIsNewBrand] = useState(false);
 
-  const toggleExpand = (id: string) => {
-    setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+  const isExpanded = (id: string, depth: number) =>
+    expanded[id] !== undefined ? expanded[id] : depth === 0;
+
+  const toggleExpand = (id: string, depth: number) => {
+    setExpanded((prev) => ({ ...prev, [id]: !isExpanded(id, depth) }));
   };
 
   const q = globalQuery.trim().toLowerCase();
@@ -49,7 +66,9 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
         if (!q) return true;
         if (c.name.toLowerCase().includes(q)) return true;
         const children = state.categories.filter(
-          (ch) => ch.parentId === c.id || state.categories.some((l2) => l2.parentId === c.id && ch.parentId === l2.id)
+          (ch) =>
+            ch.parentId === c.id ||
+            state.categories.some((l2) => l2.parentId === c.id && ch.parentId === l2.id)
         );
         return children.some((ch) => ch.name.toLowerCase().includes(q));
       });
@@ -60,7 +79,16 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
       .filter((c) => c.parentId === parentId)
       .sort((a, b) => a.sortOrder - b.sortOrder);
 
+  const handleApiError = (err: unknown, authMsg: string) => {
+    if (isAuthError(err)) {
+      onAuthRequired(authMsg);
+    } else {
+      setActionError(err instanceof Error ? err.message : 'Ошибка запроса к API');
+    }
+  };
+
   const openNewCategory = (level: 1 | 2 | 3, parentId: string | null) => {
+    setActionError(null);
     setIsNewCat(true);
     setEditingCat({
       id: uid('cat'),
@@ -69,78 +97,83 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
       level,
       parentId,
       skuCount: 0,
-      sortOrder: state.categories.filter((c) => c.parentId === parentId).length + 1,
+      sortOrder: state.categories.filter((c) => c.parentId === parentId).length,
       isActive: true,
       seoTitle: '',
       seoDescription: '',
-      filterAttributes: ['Цена', 'Бренд', 'Тип товара'],
+      filterAttributes: ['Цена', 'Бренд', 'Наличие'],
     });
   };
 
-  const saveCategory = () => {
+  const saveCategory = async () => {
     if (!editingCat || !editingCat.name.trim()) return;
-    const normalized: CategoryNode = {
-      ...editingCat,
-      slug:
-        editingCat.slug.trim() ||
-        editingCat.name
-          .toLowerCase()
-          .replace(/[^a-zа-яё0-9]+/gi, '-')
-          .replace(/^-|-$/g, ''),
-    };
-
-    setState((prev) => ({
-      ...prev,
-      categories: isNewCat
-        ? [...prev.categories, normalized]
-        : prev.categories.map((c) => (c.id === normalized.id ? normalized : c)),
-    }));
-    if (normalized.parentId) {
-      setExpanded((prev) => ({ ...prev, [normalized.parentId!]: true }));
+    setSaving(true);
+    setActionError(null);
+    try {
+      const normalized: CategoryNode = {
+        ...editingCat,
+        slug: slugifyLatin(editingCat.slug.trim() || editingCat.name),
+      };
+      await onSaveCategory(normalized, isNewCat);
+      if (normalized.parentId) {
+        setExpanded((prev) => ({ ...prev, [normalized.parentId!]: true }));
+      }
+      setEditingCat(null);
+    } catch (err) {
+      handleApiError(err, 'Для создания или изменения категории необходимо войти в аккаунт API.');
+    } finally {
+      setSaving(false);
     }
-    setEditingCat(null);
   };
 
-  const deleteCategory = (id: string) => {
-    const collectIds = (rootId: string): string[] => {
-      const direct = state.categories.filter((c) => c.parentId === rootId).map((c) => c.id);
-      return [rootId, ...direct.flatMap(collectIds)];
-    };
-    const toRemove = new Set(collectIds(id));
-    setState((prev) => ({
-      ...prev,
-      categories: prev.categories.filter((c) => !toRemove.has(c.id)),
-    }));
+  const deleteCategory = async (id: string) => {
+    setActionError(null);
+    try {
+      await onDeleteCategory(id);
+    } catch (err) {
+      handleApiError(err, 'Для удаления категории необходимо войти в аккаунт API.');
+    }
   };
 
   const openNewBrand = () => {
+    setActionError(null);
     setIsNewBrand(true);
     setEditingBrand({
       id: uid('br'),
       name: '',
-      country: 'Россия',
+      slug: '',
+      country: 'Международный',
       productCount: 0,
       isPopular: false,
       isActive: true,
     });
   };
 
-  const saveBrand = () => {
+  const saveBrand = async () => {
     if (!editingBrand || !editingBrand.name.trim()) return;
-    setState((prev) => ({
-      ...prev,
-      brands: isNewBrand
-        ? [...prev.brands, editingBrand]
-        : prev.brands.map((b) => (b.id === editingBrand.id ? editingBrand : b)),
-    }));
-    setEditingBrand(null);
+    setSaving(true);
+    setActionError(null);
+    try {
+      const normalized: Brand = {
+        ...editingBrand,
+        slug: slugifyLatin(editingBrand.slug?.trim() || editingBrand.name),
+      };
+      await onSaveBrand(normalized, isNewBrand);
+      setEditingBrand(null);
+    } catch (err) {
+      handleApiError(err, 'Для сохранения бренда необходимо войти в аккаунт API.');
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const deleteBrand = (id: string) => {
-    setState((prev) => ({
-      ...prev,
-      brands: prev.brands.filter((b) => b.id !== id),
-    }));
+  const deleteBrand = async (id: string) => {
+    setActionError(null);
+    try {
+      await onDeleteBrand(id);
+    } catch (err) {
+      handleApiError(err, 'Для удаления бренда необходимо войти в аккаунт API.');
+    }
   };
 
   const filteredBrands = state.brands.filter(
@@ -149,7 +182,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
 
   const renderCategoryRow = (cat: CategoryNode, depth: number) => {
     const children = getChildren(cat.id);
-    const isExp = !!expanded[cat.id];
+    const exp = isExpanded(cat.id, depth);
 
     return (
       <React.Fragment key={cat.id}>
@@ -162,10 +195,10 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
             {children.length > 0 ? (
               <button
                 type="button"
-                onClick={() => toggleExpand(cat.id)}
+                onClick={() => toggleExpand(cat.id, depth)}
                 className="rounded p-1 text-slate-500 hover:bg-slate-200/70"
               >
-                {isExp ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                {exp ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
               </button>
             ) : (
               <span className="inline-block w-6 text-center text-slate-300">•</span>
@@ -183,7 +216,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
               </div>
               <div className="mt-0.5 flex flex-wrap items-center gap-3 text-xs text-slate-400">
                 <span>/{cat.slug}</span>
-                <span>Фильтры: {cat.filterAttributes.join(', ') || '—'}</span>
+                <span>Сорт.: {cat.sortOrder}</span>
               </div>
             </div>
           </div>
@@ -208,6 +241,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
             <button
               type="button"
               onClick={() => {
+                setActionError(null);
                 setIsNewCat(false);
                 setEditingCat({ ...cat });
               }}
@@ -218,7 +252,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
             </button>
             <button
               type="button"
-              onClick={() => deleteCategory(cat.id)}
+              onClick={() => void deleteCategory(cat.id)}
               className="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-[#E11D48]"
               title="Удалить категорию"
             >
@@ -227,7 +261,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
           </div>
         </div>
 
-        {isExp && children.map((child) => renderCategoryRow(child, depth + 1))}
+        {exp && children.map((child) => renderCategoryRow(child, depth + 1))}
       </React.Fragment>
     );
   };
@@ -236,7 +270,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
     <div>
       <PageHeader
         title="Каталог и бренды (Мегаменю)"
-        subtitle="3-уровневая структура категорий и фильтров каталога СтройОптТорг"
+        subtitle="Дерево категорий и брендов, синхронизированное с Backend API"
         actions={
           tab === 'categories' ? (
             <button
@@ -259,6 +293,13 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
           )
         }
       />
+
+      {actionError && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-[#E11D48]">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{actionError}</span>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="mb-5 flex items-center gap-2 border-b border-[#E5E7EB]">
@@ -291,10 +332,16 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
       {tab === 'categories' ? (
         <Card className="overflow-hidden">
           <div className="flex items-center justify-between border-b border-[#E5E7EB] bg-[#F5F7FA] px-4 py-2.5 text-xs font-semibold uppercase text-slate-500">
-            <span>Раздел мегаменю / Slug / Активные фильтры</span>
+            <span>Раздел каталога / Slug</span>
             <span>Товары и действия</span>
           </div>
-          <div>{l1Categories.map((cat) => renderCategoryRow(cat, 0))}</div>
+          <div>
+            {l1Categories.length === 0 ? (
+              <div className="p-8 text-center text-sm text-slate-400">Категории не найдены</div>
+            ) : (
+              l1Categories.map((cat) => renderCategoryRow(cat, 0))
+            )}
+          </div>
         </Card>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -306,7 +353,9 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
                     <h3 className="text-base font-bold text-[#102035]">{brand.name}</h3>
                     {brand.isPopular && <Badge variant="amber">Популярный</Badge>}
                   </div>
-                  <p className="mt-0.5 text-xs text-slate-500">Страна: {brand.country}</p>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    /{brand.slug || slugifyLatin(brand.name)}
+                  </p>
                 </div>
                 <Badge variant={brand.isActive ? 'green' : 'gray'}>
                   {brand.isActive ? 'Активен' : 'Скрыт'}
@@ -321,6 +370,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
                   <button
                     type="button"
                     onClick={() => {
+                      setActionError(null);
                       setIsNewBrand(false);
                       setEditingBrand({ ...brand });
                     }}
@@ -330,7 +380,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
                   </button>
                   <button
                     type="button"
-                    onClick={() => deleteBrand(brand.id)}
+                    onClick={() => void deleteBrand(brand.id)}
                     className="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-[#E11D48]"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -347,7 +397,7 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
         open={!!editingCat}
         onClose={() => setEditingCat(null)}
         title={isNewCat ? 'Новая категория каталога' : 'Редактирование категории'}
-        subtitle={editingCat ? `Уровень ${editingCat.level} · Мегаменю` : undefined}
+        subtitle={editingCat ? `Уровень ${editingCat.level} · Backend API` : undefined}
         footer={
           <>
             <button
@@ -359,11 +409,12 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
             </button>
             <button
               type="button"
-              onClick={saveCategory}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-[#186FD4] px-4 py-2 text-sm font-semibold text-white hover:bg-[#145BB0]"
+              disabled={saving}
+              onClick={() => void saveCategory()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#186FD4] px-4 py-2 text-sm font-semibold text-white hover:bg-[#145BB0] disabled:opacity-60"
             >
               <Check className="h-4 w-4" />
-              Сохранить
+              {saving ? 'Сохранение...' : 'Сохранить'}
             </button>
           </>
         }
@@ -383,67 +434,28 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-semibold text-[#102035]">URL-код (slug)</label>
+                <label className="block text-xs font-semibold text-[#102035]">
+                  URL-код (slug, латиница)
+                </label>
                 <input
                   type="text"
                   value={editingCat.slug}
                   onChange={(e) => setEditingCat({ ...editingCat, slug: e.target.value })}
                   className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                  placeholder="perforatory"
+                  placeholder={editingCat.name ? slugifyLatin(editingCat.name) : 'perforatory'}
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-[#102035]">Кол-во SKU</label>
+                <label className="block text-xs font-semibold text-[#102035]">Порядок сортировки</label>
                 <input
                   type="number"
-                  value={editingCat.skuCount}
+                  value={editingCat.sortOrder}
                   onChange={(e) =>
-                    setEditingCat({ ...editingCat, skuCount: Number(e.target.value) || 0 })
+                    setEditingCat({ ...editingCat, sortOrder: Number(e.target.value) || 0 })
                   }
                   className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
                 />
               </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-[#102035]">
-                Атрибуты боковых фильтров (через запятую)
-              </label>
-              <input
-                type="text"
-                value={editingCat.filterAttributes.join(', ')}
-                onChange={(e) =>
-                  setEditingCat({
-                    ...editingCat,
-                    filterAttributes: e.target.value
-                      .split(',')
-                      .map((s) => s.trim())
-                      .filter(Boolean),
-                  })
-                }
-                className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                placeholder="Цена, Тип товара, Бренд, Мощность (Вт)"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-[#102035]">SEO-заголовок страницы</label>
-              <input
-                type="text"
-                value={editingCat.seoTitle ?? ''}
-                onChange={(e) => setEditingCat({ ...editingCat, seoTitle: e.target.value })}
-                className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-[#102035]">SEO-описание под каталогом</label>
-              <textarea
-                rows={3}
-                value={editingCat.seoDescription ?? ''}
-                onChange={(e) => setEditingCat({ ...editingCat, seoDescription: e.target.value })}
-                className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-              />
             </div>
 
             <label className="flex items-center gap-2 text-sm font-medium text-[#102035]">
@@ -475,10 +487,11 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
             </button>
             <button
               type="button"
-              onClick={saveBrand}
-              className="rounded-lg bg-[#186FD4] px-4 py-1.5 text-sm font-semibold text-white hover:bg-[#145BB0]"
+              disabled={saving}
+              onClick={() => void saveBrand()}
+              className="rounded-lg bg-[#186FD4] px-4 py-1.5 text-sm font-semibold text-white hover:bg-[#145BB0] disabled:opacity-60"
             >
-              Сохранить
+              {saving ? 'Сохранение...' : 'Сохранить'}
             </button>
           </>
         }
@@ -495,47 +508,29 @@ export const CatalogPage: React.FC<CatalogPageProps> = ({ state, setState, globa
                 placeholder="BOSCH"
               />
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-semibold text-[#102035]">Страна</label>
-                <input
-                  type="text"
-                  value={editingBrand.country}
-                  onChange={(e) => setEditingBrand({ ...editingBrand, country: e.target.value })}
-                  className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-[#102035]">Товаров</label>
-                <input
-                  type="number"
-                  value={editingBrand.productCount}
-                  onChange={(e) =>
-                    setEditingBrand({ ...editingBrand, productCount: Number(e.target.value) || 0 })
-                  }
-                  className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                />
-              </div>
+            <div>
+              <label className="block text-xs font-semibold text-[#102035]">
+                URL-код (slug, латиница)
+              </label>
+              <input
+                type="text"
+                value={editingBrand.slug ?? ''}
+                onChange={(e) => setEditingBrand({ ...editingBrand, slug: e.target.value })}
+                className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
+                placeholder={editingBrand.name ? slugifyLatin(editingBrand.name) : 'bosch'}
+              />
             </div>
-            <div className="flex items-center gap-5 pt-1">
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={editingBrand.isPopular}
-                  onChange={(e) => setEditingBrand({ ...editingBrand, isPopular: e.target.checked })}
-                  className="h-4 w-4 accent-[#186FD4]"
-                />
-                Популярный на главной
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={editingBrand.isActive}
-                  onChange={(e) => setEditingBrand({ ...editingBrand, isActive: e.target.checked })}
-                  className="h-4 w-4 accent-[#186FD4]"
-                />
-                Активен
-              </label>
+            <div>
+              <label className="block text-xs font-semibold text-[#102035]">Логотип (URL)</label>
+              <input
+                type="text"
+                value={editingBrand.logo ?? ''}
+                onChange={(e) =>
+                  setEditingBrand({ ...editingBrand, logo: e.target.value.trim() || null })
+                }
+                className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
+                placeholder="https://..."
+              />
             </div>
           </div>
         )}

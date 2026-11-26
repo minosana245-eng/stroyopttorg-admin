@@ -14,10 +14,14 @@ import {
   X,
   RotateCcw,
   LogOut,
+  LogIn,
+  RefreshCw,
   ExternalLink,
   Bell,
+  AlertTriangle,
 } from 'lucide-react';
 import { AdminSection, AdminState } from '../../types/admin';
+import { AuthSession } from '../../api/client';
 import { BrandLogo } from '../ui/BrandLogo';
 
 interface AdminLayoutProps {
@@ -26,8 +30,14 @@ interface AdminLayoutProps {
   globalQuery: string;
   onGlobalQueryChange: (q: string) => void;
   state: AdminState;
+  authSession: AuthSession | null;
+  apiConnected: boolean | null;
+  isSyncing: boolean;
+  syncError: string | null;
+  onSyncApi: () => void;
   onResetSeed: () => void;
-  onLockScreen: () => void;
+  onOpenLogin: () => void;
+  onLogout: () => void;
   children: React.ReactNode;
 }
 
@@ -45,8 +55,14 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
   globalQuery,
   onGlobalQueryChange,
   state,
+  authSession,
+  apiConnected,
+  isSyncing,
+  syncError,
+  onSyncApi,
   onResetSeed,
-  onLockScreen,
+  onOpenLogin,
+  onLogout,
   children,
 }) => {
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -194,28 +210,57 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
           <div className="mt-0.5 text-slate-400">
             ИНН {state.settings.inn} · КПП {state.settings.kpp}
           </div>
-          <div className="mt-1 text-[11px] text-emerald-400">
-            ● Масштаб каталога: {state.settings.totalCatalogScale.toLocaleString('ru-RU')} SKU
+          <div
+            className={`mt-1 text-[11px] ${
+              apiConnected === false ? 'text-rose-400' : 'text-emerald-400'
+            }`}
+          >
+            ●{' '}
+            {apiConnected === true
+              ? `API подключен (${state.settings.totalCatalogScale.toLocaleString('ru-RU')} SKU)`
+              : apiConnected === false
+              ? 'API недоступен (офлайн-кэш)'
+              : 'Подключение к API...'}
           </div>
         </div>
         <div className="flex items-center gap-1.5">
           <button
             type="button"
-            onClick={onResetSeed}
-            title="Сбросить демо-данные к исходным"
-            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-white/15 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-white/10 hover:text-white"
+            onClick={onSyncApi}
+            disabled={isSyncing}
+            title="Обновить данные с сервера"
+            className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-white/15 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-white/10 hover:text-white disabled:opacity-50"
           >
-            <RotateCcw className="h-3.5 w-3.5" />
-            Сброс демо
+            <RefreshCw className={`h-3.5 w-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+            Синхронизация
           </button>
           <button
             type="button"
-            onClick={onLockScreen}
-            title="Выйти / Экран входа"
-            className="flex items-center justify-center gap-1.5 rounded-lg border border-white/15 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-[#EE3F22]/20 hover:border-[#EE3F22]/40 hover:text-white"
+            onClick={onResetSeed}
+            title="Сбросить локальный кэш"
+            className="flex items-center justify-center rounded-lg border border-white/15 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-white/10 hover:text-white"
           >
-            <LogOut className="h-3.5 w-3.5" />
+            <RotateCcw className="h-3.5 w-3.5" />
           </button>
+          {authSession ? (
+            <button
+              type="button"
+              onClick={onLogout}
+              title="Выйти из аккаунта API"
+              className="flex items-center justify-center rounded-lg border border-white/15 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-[#EE3F22]/20 hover:border-[#EE3F22]/40 hover:text-white"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenLogin}
+              title="Войти в аккаунт API"
+              className="flex items-center justify-center rounded-lg border border-white/15 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-[#186FD4]/30 hover:text-white"
+            >
+              <LogIn className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -255,7 +300,7 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
                 type="text"
                 value={globalQuery}
                 onChange={(e) => onGlobalQueryChange(e.target.value)}
-                placeholder="Поиск по артикулу (XJ89YHGO), товару, заказу #56434..."
+                placeholder="Поиск по артикулу, товару, заказу..."
                 className="w-full rounded-lg border border-[#E5E7EB] bg-[#F5F7FA] py-2 pl-9 pr-3 text-sm text-[#111827] placeholder:text-slate-400 focus:border-[#186FD4] focus:bg-white focus:outline-none"
               />
             </div>
@@ -285,17 +330,46 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
               {state.settings.phone}
             </button>
 
-            <div className="flex items-center gap-2.5 border-l border-[#E5E7EB] pl-3">
-              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[#186FD4] text-xs font-bold text-white">
-                АС
+            {authSession ? (
+              <div className="flex items-center gap-2.5 border-l border-[#E5E7EB] pl-3">
+                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[#186FD4] text-xs font-bold text-white">
+                  {authSession.email.slice(0, 2).toUpperCase() || 'AD'}
+                </div>
+                <div className="hidden text-left leading-tight md:block">
+                  <div className="text-xs font-semibold text-[#102035] max-w-[140px] truncate">
+                    {authSession.email}
+                  </div>
+                  <div className="text-[11px] text-emerald-600">Авторизован</div>
+                </div>
               </div>
-              <div className="hidden text-left leading-tight md:block">
-                <div className="text-xs font-semibold text-[#102035]">Администратор</div>
-                <div className="text-[11px] text-slate-500">Руководитель продаж</div>
-              </div>
-            </div>
+            ) : (
+              <button
+                type="button"
+                onClick={onOpenLogin}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#186FD4] bg-blue-50 px-3 py-1.5 text-xs font-semibold text-[#186FD4] transition hover:bg-[#186FD4] hover:text-white"
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                Войти в API
+              </button>
+            )}
           </div>
         </header>
+
+        {syncError && (
+          <div className="mx-4 mt-4 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900 sm:mx-6">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+              <span>Не удалось синхронизироваться с сервером: {syncError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={onSyncApi}
+              className="rounded-md bg-white px-2.5 py-1 font-semibold text-amber-900 border border-amber-300 hover:bg-amber-100"
+            >
+              Повторить
+            </button>
+          </div>
+        )}
 
         <main className="flex-1 p-4 sm:p-6">{children}</main>
       </div>

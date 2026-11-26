@@ -14,13 +14,54 @@ import { SettingsPage } from './pages/SettingsPage';
 import { LoginScreen } from './pages/LoginScreen';
 
 export function App() {
-  const { state, setState, resetToSeed } = useAdminStore();
+  const {
+    state,
+    setState,
+    resetToSeed,
+    authSession,
+    login,
+    logout,
+    isSyncing,
+    apiConnected,
+    syncError,
+    syncFromApi,
+    saveCategoryApi,
+    deleteCategoryApi,
+    saveBrandApi,
+    deleteBrandApi,
+    saveProductApi,
+    deleteProductApi,
+    bulkUpdateProductsApi,
+    updateOrderStatusApi,
+    createOrderApi,
+    isAuthError,
+  } = useAdminStore();
+
   const [section, setSection] = useState<AdminSection>('dashboard');
   const [globalQuery, setGlobalQuery] = useState('');
-  const [locked, setLocked] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginNotice, setLoginNotice] = useState<string | null>(null);
 
-  if (locked) {
-    return <LoginScreen onLogin={() => setLocked(false)} />;
+  const handleAuthRequired = (message?: string) => {
+    setLoginNotice(message ?? 'Для сохранения изменений требуется вход в API.');
+    setLoginOpen(true);
+  };
+
+  if (loginOpen) {
+    return (
+      <LoginScreen
+        notice={loginNotice}
+        onLogin={async (email, password) => {
+          await login(email, password);
+          setLoginNotice(null);
+          setLoginOpen(false);
+        }}
+        onContinueReadOnly={() => {
+          setLoginNotice(null);
+          setLoginOpen(false);
+        }}
+      />
+    );
   }
 
   return (
@@ -30,18 +71,55 @@ export function App() {
       globalQuery={globalQuery}
       onGlobalQueryChange={setGlobalQuery}
       state={state}
+      authSession={authSession}
+      apiConnected={apiConnected}
+      isSyncing={isSyncing}
+      syncError={syncError}
+      onSyncApi={syncFromApi}
       onResetSeed={resetToSeed}
-      onLockScreen={() => setLocked(true)}
+      onOpenLogin={() => {
+        setLoginNotice(null);
+        setLoginOpen(true);
+      }}
+      onLogout={() => {
+        logout();
+        setLoginNotice(null);
+        setLoginOpen(true);
+      }}
     >
       {section === 'dashboard' && <DashboardPage state={state} onNavigate={setSection} />}
       {section === 'catalog' && (
-        <CatalogPage state={state} setState={setState} globalQuery={globalQuery} />
+        <CatalogPage
+          state={state}
+          globalQuery={globalQuery}
+          onSaveCategory={saveCategoryApi}
+          onDeleteCategory={deleteCategoryApi}
+          onSaveBrand={saveBrandApi}
+          onDeleteBrand={deleteBrandApi}
+          isAuthError={isAuthError}
+          onAuthRequired={handleAuthRequired}
+        />
       )}
       {section === 'products' && (
-        <ProductsPage state={state} setState={setState} globalQuery={globalQuery} />
+        <ProductsPage
+          state={state}
+          globalQuery={globalQuery}
+          onSaveProduct={saveProductApi}
+          onDeleteProduct={deleteProductApi}
+          onBulkUpdateProducts={bulkUpdateProductsApi}
+          isAuthError={isAuthError}
+          onAuthRequired={handleAuthRequired}
+        />
       )}
       {section === 'orders' && (
-        <OrdersPage state={state} setState={setState} globalQuery={globalQuery} />
+        <OrdersPage
+          state={state}
+          globalQuery={globalQuery}
+          onUpdateOrderStatus={updateOrderStatusApi}
+          onCreateOrder={createOrderApi}
+          isAuthError={isAuthError}
+          onAuthRequired={handleAuthRequired}
+        />
       )}
       {section === 'customers' && (
         <CustomersPage state={state} setState={setState} globalQuery={globalQuery} />

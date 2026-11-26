@@ -19,8 +19,10 @@ export interface ProductAttribute {
 
 export interface Product {
   id: string;
+  slug?: string;
   sku: string;
   name: string;
+  categoryId?: string;
   categoryL1Id: string;
   categoryL2Id?: string;
   categoryL3Id?: string;
@@ -56,6 +58,8 @@ export interface CategoryNode {
 export interface Brand {
   id: string;
   name: string;
+  slug?: string;
+  logo?: string | null;
   country: string;
   productCount: number;
   isPopular: boolean;
@@ -85,6 +89,9 @@ export interface OrderItem {
 export interface Order {
   id: string;
   orderNumber: string;
+  rawNumber?: string;
+  backendStatus?: string;
+  userId?: number | null;
   createdAt: string;
   status: OrderStatus;
   isOneClick: boolean;

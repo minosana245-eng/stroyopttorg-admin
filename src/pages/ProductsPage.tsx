@@ -8,6 +8,7 @@ import {
   Check,
   SlidersHorizontal,
   X,
+  AlertCircle,
 } from 'lucide-react';
 import {
   AdminState,
@@ -22,18 +23,30 @@ import {
   DrawerModal,
   PageHeader,
 } from '../components/ui/Primitives';
-import { calcDiscountPercent, formatNumber, formatRub, uid } from '../utils/format';
+import { calcDiscountPercent, formatNumber, formatRub, slugifyLatin, uid } from '../utils/format';
 
 interface ProductsPageProps {
   state: AdminState;
-  setState: React.Dispatch<React.SetStateAction<AdminState>>;
   globalQuery: string;
+  onSaveProduct: (product: Product, isNew: boolean, originalSlug?: string) => Promise<void>;
+  onDeleteProduct: (product: Product) => Promise<void>;
+  onBulkUpdateProducts: (targets: Product[], updater: (p: Product) => Product) => Promise<void>;
+  isAuthError: (err: unknown) => boolean;
+  onAuthRequired: (message?: string) => void;
 }
 
 const ALL_BADGES: ProductBadge[] = ['хит', 'новинка', 'распродажа'];
 const STOCK_OPTIONS: StockStatus[] = ['В наличии', 'Под заказ', 'Нет в наличии'];
 
-export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, globalQuery }) => {
+export const ProductsPage: React.FC<ProductsPageProps> = ({
+  state,
+  globalQuery,
+  onSaveProduct,
+  onDeleteProduct,
+  onBulkUpdateProducts,
+  isAuthError,
+  onAuthRequired,
+}) => {
   const [catFilter, setCatFilter] = useState('all');
   const [brandFilter, setBrandFilter] = useState('all');
   const [stockFilter, setStockFilter] = useState<'all' | StockStatus>('all');
@@ -44,11 +57,14 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [editing, setEditing] = useState<Product | null>(null);
+  const [originalSlug, setOriginalSlug] = useState<string | undefined>(undefined);
   const [isNew, setIsNew] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [editorTab, setEditorTab] = useState<'main' | 'pricing' | 'attrs' | 'desc'>('main');
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState(
-    'MK-9921;Болгарка Makita GA5030 720W;cat-4;br-makita;6490;7300;40\nCR-CT16;Грунтовка Ceresit CT 16 10л;cat-2;br-ceresit;1890;2100;120'
+    'MK-9921;Болгарка Makita GA5030 720W;5;3;6490;7300;40'
   );
 
   const q = globalQuery.trim().toLowerCase();
@@ -62,6 +78,38 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
     [state.brands]
   );
 
+  // Ordered hierarchical categories for selects
+  const orderedCategories = useMemo(() => {
+    const res: { id: string; label: string }[] = [];
+    const l1 = state.categories
+      .filter((c) => c.level === 1)
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+    for (const c1 of l1) {
+      res.push({ id: c1.id, label: c1.name });
+      const l2 = state.categories
+        .filter((c) => c.parentId === c1.id)
+        .sort((a, b) => a.sortOrder - b.sortOrder);
+      for (const c2 of l2) {
+        res.push({ id: c2.id, label: `— ${c2.name}` });
+        const l3 = state.categories
+          .filter((c) => c.parentId === c2.id)
+          .sort((a, b) => a.sortOrder - b.sortOrder);
+        for (const c3 of l3) {
+          res.push({ id: c3.id, label: `—— ${c3.name}` });
+        }
+      }
+    }
+    return res;
+  }, [state.categories]);
+
+  const handleApiError = (err: unknown, authMsg: string) => {
+    if (isAuthError(err)) {
+      onAuthRequired(authMsg);
+    } else {
+      setActionError(err instanceof Error ? err.message : 'Ошибка запроса к API');
+    }
+  };
+
   const filtered = useMemo(() => {
     const list = state.products.filter((p) => {
       if (q) {
@@ -71,7 +119,13 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
           (brandMap.get(p.brandId) ?? '').toLowerCase().includes(q);
         if (!hit) return false;
       }
-      if (catFilter !== 'all' && p.categoryL1Id !== catFilter && p.categoryL2Id !== catFilter) {
+      if (
+        catFilter !== 'all' &&
+        p.categoryId !== catFilter &&
+        p.categoryL1Id !== catFilter &&
+        p.categoryL2Id !== catFilter &&
+        p.categoryL3Id !== catFilter
+      ) {
         return false;
       }
       if (brandFilter !== 'all' && p.brandId !== brandFilter) return false;
@@ -104,40 +158,58 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
     }
   };
 
-  const bulkSetStock = (status: StockStatus) => {
-    setState((prev) => ({
-      ...prev,
-      products: prev.products.map((p) =>
-        selectedIds.includes(p.id)
-          ? { ...p, stockStatus: status, stockQty: status === 'Нет в наличии' ? 0 : Math.max(p.stockQty, 10) }
-          : p
-      ),
-    }));
-    setSelectedIds([]);
+  const bulkSetStock = async (status: StockStatus) => {
+    const targets = state.products.filter((p) => selectedIds.includes(p.id));
+    if (!targets.length) return;
+    setActionError(null);
+    setSaving(true);
+    try {
+      await onBulkUpdateProducts(targets, (p) => ({
+        ...p,
+        stockStatus: status,
+        isActive: status !== 'Нет в наличии',
+        stockQty: status === 'Нет в наличии' ? 0 : Math.max(p.stockQty, 10),
+      }));
+      setSelectedIds([]);
+    } catch (err) {
+      handleApiError(err, 'Для массового обновления товаров необходимо войти в аккаунт API.');
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const bulkAdjustPrice = (percentDelta: number) => {
-    setState((prev) => ({
-      ...prev,
-      products: prev.products.map((p) =>
-        selectedIds.includes(p.id)
-          ? { ...p, price: Math.max(1, Math.round(p.price * (1 + percentDelta / 100))) }
-          : p
-      ),
-    }));
-    setSelectedIds([]);
+  const bulkAdjustPrice = async (percentDelta: number) => {
+    const targets = state.products.filter((p) => selectedIds.includes(p.id));
+    if (!targets.length) return;
+    setActionError(null);
+    setSaving(true);
+    try {
+      await onBulkUpdateProducts(targets, (p) => ({
+        ...p,
+        price: Math.max(1, Math.round(p.price * (1 + percentDelta / 100))),
+      }));
+      setSelectedIds([]);
+    } catch (err) {
+      handleApiError(err, 'Для изменения цен необходимо войти в аккаунт API.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const openNewProduct = () => {
+    setActionError(null);
     setIsNew(true);
+    setOriginalSlug(undefined);
     setEditorTab('main');
+    const defaultCat = state.categories[0]?.id ?? '';
     setEditing({
       id: uid('prd'),
+      slug: '',
       sku: `ST-${Math.floor(10000 + Math.random() * 90000)}`,
       name: '',
-      categoryL1Id: 'cat-4',
-      categoryL2Id: 'cat-4-1',
-      brandId: state.brands[0]?.id ?? 'br-bosch',
+      categoryId: defaultCat,
+      categoryL1Id: defaultCat,
+      brandId: state.brands[0]?.id ?? '',
       price: 1990,
       oldPrice: 2490,
       stockQty: 25,
@@ -147,8 +219,8 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
       productType: 'Инструмент',
       description: '',
       attributes: [
-        { name: 'Тип товара', value: '' },
-        { name: 'Материал', value: '' },
+        { name: 'Мощность', value: '' },
+        { name: 'Вес', value: '' },
       ],
       relatedIds: [],
       isActive: true,
@@ -156,32 +228,32 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
     });
   };
 
-  const saveProduct = () => {
+  const saveProduct = async () => {
     if (!editing || !editing.name.trim() || !editing.sku.trim()) return;
-    const saved: Product = {
-      ...editing,
-      updatedAt: new Date().toISOString().slice(0, 10),
-    };
-    setState((prev) => ({
-      ...prev,
-      products: isNew
-        ? [saved, ...prev.products]
-        : prev.products.map((p) => (p.id === saved.id ? saved : p)),
-      settings: {
-        ...prev.settings,
-        totalCatalogScale: isNew
-          ? prev.settings.totalCatalogScale + 1
-          : prev.settings.totalCatalogScale,
-      },
-    }));
-    setEditing(null);
+    setSaving(true);
+    setActionError(null);
+    try {
+      const saved: Product = {
+        ...editing,
+        slug: slugifyLatin(editing.slug?.trim() || editing.name || editing.sku),
+        updatedAt: new Date().toISOString().slice(0, 10),
+      };
+      await onSaveProduct(saved, isNew, originalSlug);
+      setEditing(null);
+    } catch (err) {
+      handleApiError(err, 'Для сохранения товара необходимо войти в аккаунт API.');
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const deleteProduct = (id: string) => {
-    setState((prev) => ({
-      ...prev,
-      products: prev.products.filter((p) => p.id !== id),
-    }));
+  const deleteProduct = async (product: Product) => {
+    setActionError(null);
+    try {
+      await onDeleteProduct(product);
+    } catch (err) {
+      handleApiError(err, 'Для удаления товара необходимо войти в аккаунт API.');
+    }
   };
 
   const handleCsvExport = () => {
@@ -191,7 +263,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
         [
           p.sku,
           `"${p.name.replace(/"/g, '""')}"`,
-          categoryMap.get(p.categoryL1Id) ?? '',
+          categoryMap.get(p.categoryId || p.categoryL1Id) ?? '',
           brandMap.get(p.brandId) ?? '',
           p.price,
           p.oldPrice ?? '',
@@ -209,55 +281,61 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
     URL.revokeObjectURL(url);
   };
 
-  const runCsvImport = () => {
+  const runCsvImport = async () => {
     const lines = importText
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean);
-    const newItems: Product[] = lines.map((line) => {
-      const [sku, name, catL1, brandId, priceStr, oldPriceStr, qtyStr] = line.split(';');
-      const qty = Number(qtyStr) || 10;
-      return {
-        id: uid('prd'),
-        sku: sku?.trim() || `IMP-${Math.floor(Math.random() * 9999)}`,
-        name: name?.trim() || 'Новый импортированный товар',
-        categoryL1Id: categoryMap.has(catL1?.trim()) ? catL1.trim() : 'cat-4',
-        brandId: brandMap.has(brandId?.trim()) ? brandId.trim() : 'br-bosch',
-        price: Number(priceStr) || 1000,
-        oldPrice: Number(oldPriceStr) || undefined,
-        stockQty: qty,
-        stockStatus: qty > 0 ? 'В наличии' : 'Нет в наличии',
-        unit: 'шт.',
-        badges: ['новинка'],
-        productType: 'Товар',
-        description: 'Позиция добавлена через массовый импорт CSV/YML.',
-        attributes: [],
-        relatedIds: [],
-        isActive: true,
-        updatedAt: new Date().toISOString().slice(0, 10),
-      };
-    });
-
-    if (newItems.length > 0) {
-      setState((prev) => ({
-        ...prev,
-        products: [...newItems, ...prev.products],
-        settings: {
-          ...prev.settings,
-          totalCatalogScale: prev.settings.totalCatalogScale + newItems.length,
-        },
-      }));
+    if (!lines.length) {
+      setImportOpen(false);
+      return;
     }
-    setImportOpen(false);
-  };
 
-  const l1Cats = state.categories.filter((c) => c.level === 1);
+    setSaving(true);
+    setActionError(null);
+    const defaultCat = state.categories[0]?.id ?? '';
+    const defaultBrand = state.brands[0]?.id ?? '';
+    try {
+      for (const line of lines) {
+        const [sku, name, catId, brandId, priceStr, oldPriceStr, qtyStr] = line.split(';');
+        const qty = Number(qtyStr) || 10;
+        const cleanName = name?.trim() || 'Новый импортированный товар';
+        const item: Product = {
+          id: uid('prd'),
+          slug: slugifyLatin(cleanName),
+          sku: sku?.trim() || `IMP-${Math.floor(Math.random() * 9999)}`,
+          name: cleanName,
+          categoryId: categoryMap.has(catId?.trim()) ? catId.trim() : defaultCat,
+          categoryL1Id: categoryMap.has(catId?.trim()) ? catId.trim() : defaultCat,
+          brandId: brandMap.has(brandId?.trim()) ? brandId.trim() : defaultBrand,
+          price: Number(priceStr) || 1000,
+          oldPrice: Number(oldPriceStr) || undefined,
+          stockQty: qty,
+          stockStatus: qty > 0 ? 'В наличии' : 'Нет в наличии',
+          unit: 'шт.',
+          badges: ['новинка'],
+          productType: 'Товар',
+          description: 'Позиция добавлена через массовый импорт CSV.',
+          attributes: [],
+          relatedIds: [],
+          isActive: qty > 0,
+          updatedAt: new Date().toISOString().slice(0, 10),
+        };
+        await onSaveProduct(item, true);
+      }
+      setImportOpen(false);
+    } catch (err) {
+      handleApiError(err, 'Для импорта товаров необходимо войти в аккаунт API.');
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <div>
       <PageHeader
         title="Управление товарами (SKU)"
-        subtitle={`В базе магазина: ${formatNumber(state.settings.totalCatalogScale)} позиций · В витрине: ${state.products.length}`}
+        subtitle={`В базе API: ${formatNumber(state.settings.totalCatalogScale)} позиций · Загружено: ${state.products.length}`}
         actions={
           <>
             <button
@@ -266,7 +344,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
               className="inline-flex items-center gap-1.5 rounded-lg border border-[#E5E7EB] bg-white px-3.5 py-2 text-sm font-semibold text-[#102035] hover:bg-slate-50"
             >
               <Upload className="h-4 w-4 text-[#186FD4]" />
-              Импорт CSV/YML
+              Импорт CSV
             </button>
             <button
               type="button"
@@ -288,7 +366,14 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
         }
       />
 
-      {/* Filter Bar matching Figma Каталог товаров controls */}
+      {actionError && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-[#E11D48]">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{actionError}</span>
+        </div>
+      )}
+
+      {/* Filter Bar */}
       <Card className="mb-4 p-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <select
@@ -299,10 +384,10 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
             }}
             className="rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
           >
-            <option value="all">Все категории (Ур. 1)</option>
-            {l1Cats.map((c) => (
+            <option value="all">Все категории</option>
+            {orderedCategories.map((c) => (
               <option key={c.id} value={c.id}>
-                {c.name}
+                {c.label}
               </option>
             ))}
           </select>
@@ -347,7 +432,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
             }}
             className="rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
           >
-            <option value="all">Все метки (хит/новинка)</option>
+            <option value="all">Все метки (новинка/скидка)</option>
             {ALL_BADGES.map((b) => (
               <option key={b} value={b}>
                 Метка: {b}
@@ -425,28 +510,32 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={() => bulkSetStock('В наличии')}
+              disabled={saving}
+              onClick={() => void bulkSetStock('В наличии')}
               className="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-[#1A9C56] border border-emerald-200 hover:bg-emerald-50"
             >
-              В наличии
+              Активен (в наличии)
             </button>
             <button
               type="button"
-              onClick={() => bulkSetStock('Нет в наличии')}
+              disabled={saving}
+              onClick={() => void bulkSetStock('Нет в наличии')}
               className="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-[#E11D48] border border-rose-200 hover:bg-rose-50"
             >
-              Нет в наличии
+              Скрыть (нет в наличии)
             </button>
             <button
               type="button"
-              onClick={() => bulkAdjustPrice(5)}
+              disabled={saving}
+              onClick={() => void bulkAdjustPrice(5)}
               className="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-[#102035] border border-[#E5E7EB] hover:bg-slate-50"
             >
               Цена +5%
             </button>
             <button
               type="button"
-              onClick={() => bulkAdjustPrice(-10)}
+              disabled={saving}
+              onClick={() => void bulkAdjustPrice(-10)}
               className="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-[#102035] border border-[#E5E7EB] hover:bg-slate-50"
             >
               Скидка -10%
@@ -481,7 +570,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                 <th className="px-4 py-3">Артикул / Товар</th>
                 <th className="px-4 py-3">Категория / Бренд</th>
                 <th className="px-4 py-3">Метки</th>
-                <th className="px-4 py-3">Наличие</th>
+                <th className="px-4 py-3">Статус</th>
                 <th className="px-4 py-3 text-right">Цена</th>
                 <th className="px-4 py-3 text-right">Действия</th>
               </tr>
@@ -489,6 +578,11 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
             <tbody className="divide-y divide-[#E5E7EB]">
               {paginated.map((p) => {
                 const disc = calcDiscountPercent(p.price, p.oldPrice);
+                const catLabel =
+                  categoryMap.get(p.categoryId || '') ??
+                  categoryMap.get(p.categoryL2Id || '') ??
+                  categoryMap.get(p.categoryL1Id) ??
+                  p.productType;
                 return (
                   <tr key={p.id} className="transition hover:bg-slate-50">
                     <td className="px-4 py-3">
@@ -506,12 +600,11 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                       <div className="font-semibold text-[#102035]">{p.name}</div>
                       <div className="mt-0.5 text-xs text-slate-400">
                         Характеристик: {p.attributes.length}
+                        {p.slug ? ` · /${p.slug}` : ''}
                       </div>
                     </td>
                     <td className="px-4 py-3 text-xs">
-                      <div className="font-medium text-[#111827]">
-                        {categoryMap.get(p.categoryL1Id) ?? '—'}
-                      </div>
+                      <div className="font-medium text-[#111827]">{catLabel || '—'}</div>
                       <div className="mt-0.5 text-slate-500">
                         Бренд: <strong>{brandMap.get(p.brandId) ?? '—'}</strong>
                       </div>
@@ -530,20 +623,9 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                       </div>
                     </td>
                     <td className="px-4 py-3">
-                      <Badge
-                        variant={
-                          p.stockStatus === 'В наличии'
-                            ? 'green'
-                            : p.stockStatus === 'Под заказ'
-                            ? 'amber'
-                            : 'red'
-                        }
-                      >
-                        {p.stockStatus}
+                      <Badge variant={p.isActive ? 'green' : 'red'}>
+                        {p.isActive ? 'Активен' : 'Скрыт'}
                       </Badge>
-                      <div className="mt-1 text-xs text-slate-500 tabular-nums">
-                        {p.stockQty} {p.unit}
-                      </div>
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums whitespace-nowrap">
                       <div className="font-bold text-[#102035]">{formatRub(p.price)}</div>
@@ -558,7 +640,9 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                         <button
                           type="button"
                           onClick={() => {
+                            setActionError(null);
                             setIsNew(false);
+                            setOriginalSlug(p.slug);
                             setEditorTab('main');
                             setEditing({ ...p, attributes: p.attributes.map((a) => ({ ...a })) });
                           }}
@@ -569,7 +653,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                         </button>
                         <button
                           type="button"
-                          onClick={() => deleteProduct(p.id)}
+                          onClick={() => void deleteProduct(p)}
                           className="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-[#E11D48]"
                           title="Удалить"
                         >
@@ -615,7 +699,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
         open={!!editing}
         onClose={() => setEditing(null)}
         title={isNew ? 'Новый товар' : `Товар ${editing?.sku ?? ''}`}
-        subtitle={editing?.name || 'Карточка товара — СтройОптТорг'}
+        subtitle={editing?.name || 'Карточка товара — Backend API'}
         footer={
           <>
             <button
@@ -627,11 +711,12 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
             </button>
             <button
               type="button"
-              onClick={saveProduct}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-[#186FD4] px-4 py-2 text-sm font-semibold text-white hover:bg-[#145BB0]"
+              disabled={saving}
+              onClick={() => void saveProduct()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#186FD4] px-4 py-2 text-sm font-semibold text-white hover:bg-[#145BB0] disabled:opacity-60"
             >
               <Check className="h-4 w-4" />
-              Сохранить товар
+              {saving ? 'Сохранение...' : 'Сохранить товар'}
             </button>
           </>
         }
@@ -642,7 +727,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
               {(
                 [
                   ['main', 'Основное'],
-                  ['pricing', 'Цены и склад'],
+                  ['pricing', 'Цены и статус'],
                   ['attrs', `Характеристики (${editing.attributes.length})`],
                   ['desc', 'Описание'],
                 ] as const
@@ -673,7 +758,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                     value={editing.name}
                     onChange={(e) => setEditing({ ...editing, name: e.target.value })}
                     className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                    placeholder="Перфоратор универсальный Wander X645-46 GF 1450W"
+                    placeholder="Перфоратор Bosch GBH 2-26 DFR"
                   />
                 </div>
 
@@ -688,36 +773,36 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-[#102035]">Тип товара</label>
+                    <label className="block text-xs font-semibold text-[#102035]">
+                      URL-код (slug, латиница)
+                    </label>
                     <input
                       type="text"
-                      value={editing.productType}
-                      onChange={(e) => setEditing({ ...editing, productType: e.target.value })}
-                      className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                      placeholder="Набор / Инструмент"
+                      value={editing.slug ?? ''}
+                      onChange={(e) => setEditing({ ...editing, slug: e.target.value })}
+                      placeholder={editing.name ? slugifyLatin(editing.name) : 'bosch-gbh-2-26'}
+                      className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 font-mono text-sm focus:border-[#186FD4] focus:outline-none"
                     />
                   </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-xs font-semibold text-[#102035]">
-                      Категория (Ур. 1)
-                    </label>
+                    <label className="block text-xs font-semibold text-[#102035]">Категория *</label>
                     <select
-                      value={editing.categoryL1Id}
+                      value={editing.categoryId ?? editing.categoryL2Id ?? editing.categoryL1Id}
                       onChange={(e) =>
                         setEditing({
                           ...editing,
+                          categoryId: e.target.value,
                           categoryL1Id: e.target.value,
-                          categoryL2Id: undefined,
                         })
                       }
                       className="mt-1 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
                     >
-                      {l1Cats.map((c) => (
+                      {orderedCategories.map((c) => (
                         <option key={c.id} value={c.id}>
-                          {c.name}
+                          {c.label}
                         </option>
                       ))}
                     </select>
@@ -730,44 +815,13 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                       onChange={(e) => setEditing({ ...editing, brandId: e.target.value })}
                       className="mt-1 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
                     >
+                      <option value="">Без бренда</option>
                       {state.brands.map((b) => (
                         <option key={b.id} value={b.id}>
                           {b.name}
                         </option>
                       ))}
                     </select>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-[#102035] mb-1.5">
-                    Маркетинговые метки (бейджи)
-                  </label>
-                  <div className="flex flex-wrap gap-2">
-                    {ALL_BADGES.map((b) => {
-                      const active = editing.badges.includes(b);
-                      return (
-                        <button
-                          key={b}
-                          type="button"
-                          onClick={() =>
-                            setEditing({
-                              ...editing,
-                              badges: active
-                                ? editing.badges.filter((x) => x !== b)
-                                : [...editing.badges, b],
-                            })
-                          }
-                          className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition ${
-                            active
-                              ? 'border-[#186FD4] bg-blue-50 text-[#186FD4]'
-                              : 'border-[#E5E7EB] text-slate-600'
-                          }`}
-                        >
-                          {b}
-                        </button>
-                      );
-                    })}
                   </div>
                 </div>
               </div>
@@ -812,51 +866,28 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                   </div>
                 )}
 
-                <div className="grid grid-cols-3 gap-3">
-                  <div>
-                    <label className="block text-xs font-semibold text-[#102035]">Статус наличия</label>
-                    <select
-                      value={editing.stockStatus}
-                      onChange={(e) =>
-                        setEditing({ ...editing, stockStatus: e.target.value as StockStatus })
-                      }
-                      className="mt-1 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                    >
-                      {STOCK_OPTIONS.map((s) => (
-                        <option key={s} value={s}>
-                          {s}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-[#102035]">Остаток</label>
-                    <input
-                      type="number"
-                      value={editing.stockQty}
-                      onChange={(e) =>
-                        setEditing({ ...editing, stockQty: Math.max(0, Number(e.target.value) || 0) })
-                      }
-                      className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-[#102035]">Ед. изм.</label>
-                    <input
-                      type="text"
-                      value={editing.unit}
-                      onChange={(e) => setEditing({ ...editing, unit: e.target.value })}
-                      className="mt-1 w-full rounded-lg border border-[#E5E7EB] px-3 py-2 text-sm focus:border-[#186FD4] focus:outline-none"
-                    />
-                  </div>
-                </div>
+                <label className="flex items-center gap-2 text-sm font-medium text-[#102035]">
+                  <input
+                    type="checkbox"
+                    checked={editing.isActive}
+                    onChange={(e) =>
+                      setEditing({
+                        ...editing,
+                        isActive: e.target.checked,
+                        stockStatus: e.target.checked ? 'В наличии' : 'Нет в наличии',
+                      })
+                    }
+                    className="h-4 w-4 accent-[#186FD4]"
+                  />
+                  Товар активен и отображается на витрине
+                </label>
               </div>
             )}
 
             {editorTab === 'attrs' && (
               <div className="space-y-3">
                 <p className="text-xs text-slate-500">
-                  Технические характеристики отображаются на вкладке «О товаре» и участвуют в фильтрации каталога.
+                  Технические характеристики сохраняются в <code>attrs_json</code> на сервере.
                 </p>
                 {editing.attributes.map((attr, idx) => (
                   <div key={idx} className="flex items-center gap-2">
@@ -868,7 +899,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                         next[idx] = { ...next[idx], name: e.target.value };
                         setEditing({ ...editing, attributes: next });
                       }}
-                      placeholder="Параметр (Мощность, Вт)"
+                      placeholder="Параметр (Мощность)"
                       className="w-1/2 rounded-lg border border-[#E5E7EB] px-3 py-1.5 text-sm focus:border-[#186FD4] focus:outline-none"
                     />
                     <input
@@ -879,7 +910,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
                         next[idx] = { ...next[idx], value: e.target.value };
                         setEditing({ ...editing, attributes: next });
                       }}
-                      placeholder="Значение (1450 Вт)"
+                      placeholder="Значение (800 Вт)"
                       className="w-1/2 rounded-lg border border-[#E5E7EB] px-3 py-1.5 text-sm focus:border-[#186FD4] focus:outline-none"
                     />
                     <button
@@ -915,7 +946,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
             {editorTab === 'desc' && (
               <div>
                 <label className="block text-xs font-semibold text-[#102035]">
-                  Полное описание товара (вкладка «О товаре»)
+                  Полное описание товара
                 </label>
                 <textarea
                   rows={7}
@@ -929,11 +960,11 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
         )}
       </DrawerModal>
 
-      {/* Bulk CSV/YML Import Modal */}
+      {/* Bulk CSV Import Modal */}
       <CenterModal
         open={importOpen}
         onClose={() => setImportOpen(false)}
-        title="Массовый импорт позиций (CSV / прайс-лист 1С)"
+        title="Массовый импорт позиций в API (CSV)"
         maxWidthClass="max-w-xl"
         footer={
           <>
@@ -946,10 +977,11 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({ state, setState, glo
             </button>
             <button
               type="button"
-              onClick={runCsvImport}
-              className="rounded-lg bg-[#186FD4] px-4 py-1.5 text-sm font-semibold text-white hover:bg-[#145BB0]"
+              disabled={saving}
+              onClick={() => void runCsvImport()}
+              className="rounded-lg bg-[#186FD4] px-4 py-1.5 text-sm font-semibold text-white hover:bg-[#145BB0] disabled:opacity-60"
             >
-              Загрузить в каталог
+              {saving ? 'Загрузка...' : 'Загрузить в API'}
             </button>
           </>
         }
